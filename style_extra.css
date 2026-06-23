@@ -1,0 +1,559 @@
+// public/app.js
+// ════════════════════════════════════════════════════════════════════════════
+// APP CONTROLLER
+// ════════════════════════════════════════════════════════════════════════════
+
+const App = {
+  currentPage: 'dashboard',
+  mode: null, // 'owner' | 'visitor'
+  liveTileIds: [],
+  _dupPanelOpen: false,
+  _cmpYear: new Date().getFullYear(),
+  _cmpRefDate: new Date(),
+
+  async init() {
+    document.querySelectorAll('.nav-btn').forEach(btn => btn.addEventListener('click', () => this.go(btn.dataset.page)));
+
+    // Try resuming an owner session first
+    if (Auth.isOwner()) {
+      const owner = await Auth.whoami();
+      if (owner || !navigator.onLine) { await this.bootOwnerMode(); return; }
+      // token was invalid and we're online — fall through to auth screen
+    }
+
+    const exists = await Auth.ownerExists();
+    this.renderAuthScreen(exists);
+  },
+
+  renderAuthScreen(ownerExists) {
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    document.getElementById('nav-links-wrap')?.classList.add('hidden');
+    const root = document.getElementById('app-root');
+    root.innerHTML = `<div id="page-authscreen" class="page active"></div>`;
+    document.getElementById('page-authscreen').innerHTML = renderAuthPage(ownerExists);
+  },
+
+  async bootOwnerMode() {
+    this.mode = 'owner';
+    this.renderShell(true);
+    await this.go('dashboard');
+    DB.syncToServer();
+  },
+
+  bootVisitorMode() {
+    this.mode = 'visitor';
+    this.renderShell(false);
+    this.go('visitor-browse');
+    // show consent banner once
+    setTimeout(() => {
+      const root = document.getElementById('app-root');
+      const banner = document.createElement('div');
+      banner.innerHTML = renderConsentBanner();
+      root.prepend(banner.firstElementChild);
+    }, 400);
+  },
+
+  renderShell(isOwner) {
+    const root = document.getElementById('app-root');
+    if (isOwner) {
+      root.innerHTML = `
+        <div id="page-dashboard" class="page active"></div>
+        <div id="page-add" class="page"></div>
+        <div id="page-compare" class="page"></div>
+        <div id="page-match" class="page"></div>
+        <div id="page-database" class="page"></div>
+        <div id="page-visitorlog" class="page"></div>`;
+      document.getElementById('nav-links-wrap').innerHTML = `
+        <button class="nav-btn active" data-page="dashboard">Dashboard</button>
+        <button class="nav-btn" data-page="add">Add Person</button>
+        <button class="nav-btn" data-page="compare">Compare</button>
+        <button class="nav-btn" data-page="match">Predictions</button>
+        <button class="nav-btn" data-page="database">Database</button>
+        <button class="nav-btn" data-page="visitorlog">Visitors</button>
+        <button class="nav-btn" data-page="logout" onclick="App.logout()">Log out</button>`;
+    } else {
+      root.innerHTML = `
+        <div id="page-visitor-browse" class="page active"></div>
+        <div id="page-book" class="page"></div>`;
+      document.getElementById('nav-links-wrap').innerHTML = `
+        <button class="nav-btn active" data-page="visitor-browse">Browse</button>
+        <button class="nav-btn" data-page="book">Request a Session</button>`;
+    }
+    document.getElementById('nav-links-wrap').classList.remove('hidden');
+    document.querySelectorAll('.nav-btn[data-page]').forEach(btn => btn.addEventListener('click', () => this.go(btn.dataset.page)));
+  },
+
+  logout() {
+    Auth.logout();
+    location.reload();
+  },
+
+  async go(page, param = null) {
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+    const pageEl = document.getElementById(`page-${page}`);
+    const navBtn = document.querySelector(`.nav-btn[data-page="${page}"]`);
+    if (pageEl) pageEl.classList.add('active');
+    if (navBtn) navBtn.classList.add('active');
+    this.currentPage = page;
+    this._dupPanelOpen = false;
+    if (!pageEl) return;
+
+    pageEl.innerHTML = `<div class="page-loading">Loading…</div>`;
+
+    switch (page) {
+      case 'dashboard': pageEl.innerHTML = await renderDashboard(); break;
+      case 'add': pageEl.innerHTML = renderAddForm(); break;
+      case 'compare':
+        pageEl.innerHTML = await renderComparePage(param);
+        if (param) setTimeout(() => { const cb = document.querySelector(`.cmp-checkbox[value="${param}"]`); if (cb) { cb.checked = true; this.updateCmpSelection(); } }, 50);
+        break;
+      case 'database': pageEl.innerHTML = await renderDatabasePage(); break;
+      case 'match': pageEl.innerHTML = await renderMatchPage(); break;
+      case 'visitorlog': pageEl.innerHTML = await renderVisitorLogPage(); break;
+      case 'visitor-browse':
+        VisitorUI.allPersons = await VisitorAPI.getPersons();
+        pageEl.innerHTML = renderVisitorBrowse(VisitorUI.allPersons);
+        break;
+      case 'book': pageEl.innerHTML = renderBookingPage(); break;
+    }
+    window.scrollTo && window.scrollTo(0, 0);
+  },
+
+  // ── PHOTO ──────────────────────────────────────────────────────────────────────
+  handlePhotoSelect(input) {
+    const file = input.files[0];
+    if (!file) return;
+    resizeImageFile(file, 320, (dataUrl) => {
+      const area = document.getElementById('photo-area');
+      const hidden = document.getElementById('photo-hidden');
+      if (area) area.innerHTML = `<img id="photo-preview-img" src="${dataUrl}" class="photo-preview-img" />
+        <input type="file" id="photo-file-input" accept="image/*" style="display:none" onchange="App.handlePhotoSelect(this)" />`;
+      if (hidden) hidden.value = dataUrl;
+      let rmBtn = document.querySelector('.btn-remove-photo');
+      if (!rmBtn) {
+        rmBtn = document.createElement('button');
+        rmBtn.type = 'button'; rmBtn.className = 'btn-remove-photo'; rmBtn.textContent = '✕ Remove Photo';
+        rmBtn.onclick = () => App.removePhoto();
+        area.parentNode.insertBefore(rmBtn, area.nextSibling);
+      }
+    });
+  },
+  removePhoto() {
+    const area = document.getElementById('photo-area'), hidden = document.getElementById('photo-hidden');
+    if (area) area.innerHTML = `<div id="photo-placeholder" class="photo-placeholder"><span class="photo-icon">📷</span><span>Add Photo</span><span class="hint" style="margin-top:2px">optional</span></div>
+      <input type="file" id="photo-file-input" accept="image/*" style="display:none" onchange="App.handlePhotoSelect(this)" />`;
+    if (hidden) hidden.value = '';
+    document.querySelector('.btn-remove-photo')?.remove();
+  },
+
+  // ── YEAR / TEAM ROWS ────────────────────────────────────────────────────────────
+  addYearBlock() {
+    const container = document.getElementById('years-container');
+    if (!container) return;
+    const usedYears = [...container.querySelectorAll('.year-input')].map(i => parseInt(i.value));
+    const newYear = (usedYears.length ? Math.max(...usedYears) : new Date().getFullYear() - 1) + 1;
+    const div = document.createElement('div');
+    div.innerHTML = renderYearBlock(newYear, [{ team: '', league: '', role: '' }]);
+    container.appendChild(div.firstElementChild);
+  },
+  addTeamRowToYear(btn) {
+    const block = btn.closest('.year-block');
+    const rowsContainer = block.querySelector('.year-team-rows');
+    const div = document.createElement('div');
+    div.innerHTML = renderTeamRowInYear({});
+    rowsContainer.appendChild(div.firstElementChild);
+  },
+
+  // ── PERSON CRUD ─────────────────────────────────────────────────────────────────
+  collectTeamsByYear(form) {
+    const teamsByYear = {};
+    form.querySelectorAll('.year-block').forEach(block => {
+      const year = block.querySelector('.year-input').value;
+      const rows = [...block.querySelectorAll('.team-row-y')].map(row => ({
+        team: row.querySelector('.ty-team').value.trim(),
+        league: row.querySelector('.ty-league').value.trim(),
+        role: row.querySelector('.ty-role').value.trim(),
+      })).filter(t => t.team);
+      if (rows.length) teamsByYear[year] = rows;
+    });
+    return teamsByYear;
+  },
+
+  async savePerson(e, id) {
+    e.preventDefault();
+    const form = document.getElementById('person-form');
+    const data = new FormData(form);
+    const person = {
+      name: data.get('name').trim(),
+      dob: data.get('dob').trim(),
+      timeOfBirth: data.get('timeOfBirth') || '',
+      placeOfBirth: data.get('placeOfBirth') || '',
+      occupation: data.get('occupation') || '',
+      jerseyNumber: data.get('jerseyNumber') || '',
+      party: data.get('party') || '',
+      notes: data.get('notes') || '',
+      photo: document.getElementById('photo-hidden')?.value || '', // optional — empty string if not added
+      teamsByYear: this.collectTeamsByYear(form),
+    };
+    if (!this.validateDOB(person.dob)) { alert('Please enter DOB in DD/MM/YYYY format'); return; }
+
+    if (id) {
+      const all = await DB.getAll();
+      const existing = all.find(p => p.id === id);
+      person.verified = existing?.verified || false;
+      await DB.update(id, person);
+      this.toast('✔ Saved!');
+      this.go('database');
+    } else {
+      await this.checkDuplicateBeforeAdd(person, async () => { await DB.add(person); this.toast('Person added!'); this.go('database'); });
+    }
+  },
+
+  async checkDuplicateBeforeAdd(person, onConfirm) {
+    const all = await DB.getAll();
+    const nameKey = person.name.toLowerCase().trim();
+    const exactMatch = all.find(p => p.name.toLowerCase().trim() === nameKey && p.dob === person.dob);
+    const nameMatch = !exactMatch && all.find(p => p.name.toLowerCase().trim() === nameKey);
+    if (exactMatch) {
+      this.showDupModal({ title: '⚠ Exact Duplicate Found', msg: `"${person.name}" with DOB ${person.dob} already exists.`, existing: exactMatch, onAdd: onConfirm, onDelete: async () => { await DB.delete(exactMatch.id); onConfirm(); } });
+    } else if (nameMatch) {
+      this.showDupModal({ title: '⚠ Same Name Exists', msg: `"${person.name}" already exists with DOB ${nameMatch.dob}. Same person?`, existing: nameMatch, onAdd: onConfirm, onDelete: async () => { await DB.delete(nameMatch.id); onConfirm(); } });
+    } else onConfirm();
+  },
+
+  showDupModal({ title, msg, existing, onAdd, onDelete }) {
+    const k = calcKundali(existing.dob);
+    const modal = document.createElement('div');
+    modal.className = 'modal-overlay';
+    modal.innerHTML = `
+      <div class="modal-box dup-modal-box">
+        <h3>${title}</h3><p class="dup-modal-msg">${msg}</p>
+        <div class="dup-existing-card">
+          <div class="dec-avatar">${avatarHtml(existing, 'sm')}</div>
+          <div class="dec-info">
+            <div class="dec-name">${existing.name}</div>
+            <div class="dec-dob">DOB: ${existing.dob || '–'} · ${getCurrentYearTeam(existing)}</div>
+            ${k ? `<div class="dec-nums"><span class="b-badge">B:${k.basic}</span><span class="d-badge">D:${k.destiny}</span></div>` : ''}
+            ${verifiedBadge(existing)}
+          </div>
+        </div>
+        <div class="dup-modal-actions">
+          <button class="btn-primary" id="dm-add">Add Anyway</button>
+          <button class="btn-danger-sm" id="dm-replace">Delete Existing &amp; Add New</button>
+          <button class="btn-secondary" id="dm-cancel">Cancel</button>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+    modal.querySelector('#dm-add').onclick = () => { modal.remove(); onAdd(); };
+    modal.querySelector('#dm-replace').onclick = () => { modal.remove(); onDelete(); };
+    modal.querySelector('#dm-cancel').onclick = () => modal.remove();
+  },
+
+  validateDOB(dob) { return /^\d{2}\/\d{2}\/\d{4}$/.test(dob); },
+
+  editPerson(id) {
+    DB.getById(id).then(person => {
+      if (!person) return;
+      document.querySelector('.modal-overlay')?.remove();
+      const pageEl = document.getElementById('page-add');
+      document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+      document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+      pageEl.classList.add('active');
+      document.querySelector('.nav-btn[data-page="add"]')?.classList.add('active');
+      pageEl.innerHTML = renderAddForm(person);
+      window.scrollTo && window.scrollTo(0, 0);
+    });
+  },
+
+  async openPerson(id) {
+    const person = await DB.getById(id);
+    if (!person) return;
+    document.querySelector('.modal-overlay')?.remove();
+    const modal = document.createElement('div');
+    modal.className = 'modal-overlay';
+    modal.innerHTML = `<div class="modal-box"><button class="modal-close" onclick="this.closest('.modal-overlay').remove()">✕</button>${renderPersonView(person)}</div>`;
+    document.body.appendChild(modal);
+  },
+
+  async deletePerson(id) {
+    const p = await DB.getById(id);
+    if (!confirm(`Delete "${p?.name}"? Cannot be undone.`)) return;
+    await DB.delete(id);
+    document.querySelector('.modal-overlay')?.remove();
+    this.toast('Deleted');
+    this.go('database');
+  },
+  async deleteSingle(id) {
+    const p = await DB.getById(id);
+    if (!p || !confirm(`Delete "${p.name}"? Cannot be undone.`)) return;
+    await DB.delete(id);
+    this.toast('Deleted');
+    this.applyDbFilter();
+  },
+
+  // ── DASHA EXPLORER INTERACTIVITY ────────────────────────────────────────────────
+  async refreshPersonDasha(id) {
+    const person = await DB.getById(id);
+    const k = calcKundali(person.dob);
+    const dateVal = document.getElementById('pv-dasha-date')?.value;
+    const timeVal = document.getElementById('pv-dasha-time')?.value || '12:00';
+    const at = new Date(`${dateVal}T${timeVal}`);
+    document.getElementById('pv-dasha-explorer').innerHTML = renderDashaExplorer(person, k, at);
+  },
+  setDashaNow(id) {
+    const now = new Date();
+    document.getElementById('pv-dasha-date').value = now.toISOString().slice(0,10);
+    document.getElementById('pv-dasha-time').value = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
+    this.refreshPersonDasha(id);
+  },
+
+  // ── VERIFY ──────────────────────────────────────────────────────────────────────
+  async toggleVerify(id, refreshTable = false, refreshForm = false) {
+    const p = await DB.getById(id);
+    if (!p) return;
+    await DB.update(id, { verified: !p.verified });
+    this.toast(p.verified ? 'Marked unverified' : '✔ Verified!');
+    if (refreshTable) this.applyDbFilter();
+    if (refreshForm) this.editPerson(id);
+    if (document.querySelector('.modal-overlay .person-view')) { document.querySelector('.modal-overlay')?.remove(); this.openPerson(id); }
+  },
+
+  // ── BULK ────────────────────────────────────────────────────────────────────────
+  onRowCheck() {
+    const checked = [...document.querySelectorAll('.row-cb:checked')];
+    const cnt = document.getElementById('bulk-sel-count');
+    if (cnt) cnt.textContent = checked.length ? `${checked.length} selected` : '0 selected';
+    const all = document.querySelectorAll('.row-cb');
+    const allChecked = checked.length === all.length && all.length > 0;
+    ['sel-all-cb', 'sel-all-cb2'].forEach(id => { const el = document.getElementById(id); if (el) { el.checked = allChecked; el.indeterminate = checked.length > 0 && !allChecked; } });
+    document.querySelector('.bulk-toolbar')?.classList.toggle('has-selection', checked.length > 0);
+  },
+  toggleSelectAll(checked) {
+    document.querySelectorAll('.row-cb').forEach(cb => cb.checked = checked);
+    ['sel-all-cb', 'sel-all-cb2'].forEach(id => { const el = document.getElementById(id); if (el) { el.checked = checked; el.indeterminate = false; } });
+    this.onRowCheck();
+  },
+  getCheckedIds() { return [...document.querySelectorAll('.row-cb:checked')].map(cb => cb.value); },
+  async bulkDelete() {
+    const ids = this.getCheckedIds();
+    if (!ids.length) { this.toast('Select rows first'); return; }
+    if (!confirm(`Permanently delete ${ids.length} person${ids.length > 1 ? 's' : ''}?`)) return;
+    await DB.deleteMany(ids); this.toast(`🗑 ${ids.length} deleted`); this.go('database');
+  },
+  async bulkVerify() {
+    const ids = this.getCheckedIds();
+    if (!ids.length) { this.toast('Select rows first'); return; }
+    for (const id of ids) await DB.update(id, { verified: true });
+    this.toast(`✔ ${ids.length} verified`); this.applyDbFilter(); this.onRowCheck();
+  },
+  async bulkUnverify() {
+    const ids = this.getCheckedIds();
+    if (!ids.length) { this.toast('Select rows first'); return; }
+    for (const id of ids) await DB.update(id, { verified: false });
+    this.toast(`${ids.length} unverified`); this.applyDbFilter(); this.onRowCheck();
+  },
+  bulkEditFirst() {
+    const ids = this.getCheckedIds();
+    if (!ids.length) { this.toast('Select a row first'); return; }
+    if (ids.length > 1) { this.toast('Select only 1 row to edit'); return; }
+    this.editPerson(ids[0]);
+  },
+
+  async confirmClearAll() {
+    const all = await DB.getAll();
+    const total = all.length;
+    if (!total) { alert('Database is already empty.'); return; }
+    const modal = document.createElement('div');
+    modal.className = 'modal-overlay';
+    modal.innerHTML = `
+      <div class="modal-box clear-modal">
+        <h3>🗑 Clear All Data</h3>
+        <p class="clear-warn">Permanently delete <strong>all ${total} persons</strong>.</p>
+        <p class="clear-warn2">Type <strong>DELETE</strong> to confirm:</p>
+        <input id="clear-confirm-input" type="text" placeholder="Type DELETE" class="clear-input" autocomplete="off" />
+        <div class="clear-actions">
+          <button class="bt-btn bt-delete" id="clear-confirm-btn" disabled onclick="App.executeClearing()">Delete all ${total} records</button>
+          <button class="btn-secondary" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+    modal.querySelector('#clear-confirm-input').addEventListener('input', function () { modal.querySelector('#clear-confirm-btn').disabled = this.value.trim() !== 'DELETE'; });
+  },
+  async executeClearing() {
+    const all = await DB.getAll();
+    await DB.deleteMany(all.map(p => p.id));
+    document.querySelector('.modal-overlay')?.remove();
+    this.toast('All records cleared');
+    this.go('database');
+  },
+
+  async showDuplicates() {
+    const panel = document.getElementById('dup-panel');
+    if (!panel) return;
+    this._dupPanelOpen = !this._dupPanelOpen;
+    if (this._dupPanelOpen) {
+      const all = await DB.getAll();
+      panel.style.display = 'block'; panel.innerHTML = renderDuplicatesPanel(DB.findDuplicates(all));
+      panel.scrollIntoView && panel.scrollIntoView({ behavior: 'smooth' });
+    } else panel.style.display = 'none';
+  },
+  async deleteDup(id) {
+    const p = await DB.getById(id);
+    if (!confirm(`Delete duplicate "${p?.name}" (${p?.dob})?`)) return;
+    await DB.delete(id); this.toast('Duplicate deleted');
+    const panel = document.getElementById('dup-panel');
+    if (panel && panel.style.display !== 'none') { const all = await DB.getAll(); panel.innerHTML = renderDuplicatesPanel(DB.findDuplicates(all)); }
+    this.applyDbFilter();
+  },
+
+  // ── KUNDALI PREVIEW ──────────────────────────────────────────────────────────────
+  previewKundali(dob) {
+    const box = document.getElementById('kundali-preview');
+    if (!box) return;
+    if (!this.validateDOB(dob)) { box.innerHTML = '<p class="hint">Enter a valid DOB (DD/MM/YYYY)</p>'; return; }
+    const k = calcKundali(dob);
+    box.innerHTML = k ? renderKundaliGrid(k) : '<p class="hint">Invalid DOB</p>';
+  },
+
+  // ── CHALDEAN NAME NUMEROLOGY (only computed when explicitly requested) ───────────
+  showChaldean(name) {
+    const result = calcChaldean(name);
+    const box = document.getElementById('chaldean-result');
+    if (!box) return;
+    box.innerHTML = renderChaldeanResult(result);
+  },
+
+  // ── COMPARISON ───────────────────────────────────────────────────────────────────
+  async filterCmpPersons(q) {
+    const list = document.getElementById('cmp-person-list');
+    if (!list) return;
+    const selected = this.getSelectedCmpIds();
+    const all = await DB.getAll();
+    const persons = DB.search(all, { name: q });
+    list.innerHTML = persons.map(p => `
+      <label class="cmp-person-item">
+        <input type="checkbox" value="${p.id}" class="cmp-checkbox" ${selected.includes(p.id) ? 'checked' : ''} onchange="App.updateCmpSelection()" />
+        ${avatarHtml(p, 'xs')}<span class="cpi-name">${p.name}</span><span class="cpi-dob">${p.dob || '–'}</span>
+        <span class="cpi-team">${getCurrentYearTeam(p)}</span>${p.verified ? '<span class="cpi-v">✔</span>' : ''}
+      </label>`).join('');
+    this.updateCmpSelection();
+  },
+  getSelectedCmpIds() { return [...document.querySelectorAll('.cmp-checkbox:checked')].map(cb => cb.value); },
+  updateCmpSelection() { const ids = this.getSelectedCmpIds(); const info = document.getElementById('cmp-selected-info'); if (info) info.textContent = `${ids.length} selected`; },
+
+  async runComparison() {
+    const ids = this.getSelectedCmpIds();
+    if (!ids.length) { alert('Select at least one person.'); return; }
+    const all = await DB.getAll();
+    const persons = ids.map(id => all.find(p => p.id === id)).filter(Boolean);
+    this._cmpYear = parseInt(document.getElementById('cmp-year')?.value) || new Date().getFullYear();
+    this._cmpRefDate = new Date();
+    this.liveTileIds = autoSuggestLiveIds(persons, this._cmpYear);
+    const result = document.getElementById('comparison-result');
+    if (result) { result.innerHTML = renderComparisonGrid(persons, this._cmpRefDate, this._cmpYear, this.liveTileIds); result.scrollIntoView && result.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+  },
+  async updateRefDate(dateVal) {
+    const timeVal = document.getElementById('cmp-ref-time')?.value || '12:00';
+    this._cmpRefDate = new Date(`${dateVal}T${timeVal}`);
+    const ids = this.getSelectedCmpIds();
+    const all = await DB.getAll();
+    const persons = ids.map(id => all.find(p => p.id === id)).filter(Boolean);
+    const result = document.getElementById('comparison-result');
+    if (result) result.innerHTML = renderComparisonGrid(persons, this._cmpRefDate, this._cmpYear, this.liveTileIds);
+  },
+  async toggleLiveTile(id) {
+    if (this.liveTileIds.includes(id)) this.liveTileIds = this.liveTileIds.filter(x => x !== id);
+    else this.liveTileIds.push(id);
+    const ids = this.getSelectedCmpIds();
+    const all = await DB.getAll();
+    const persons = ids.map(id => all.find(p => p.id === id)).filter(Boolean);
+    const result = document.getElementById('comparison-result');
+    if (result) result.innerHTML = renderComparisonGrid(persons, this._cmpRefDate, this._cmpYear, this.liveTileIds);
+  },
+
+  // ── GROUPS ───────────────────────────────────────────────────────────────────────
+  async saveGroup() {
+    const ids = this.getSelectedCmpIds();
+    if (!ids.length) { alert('Select at least one person first.'); return; }
+    const name = document.getElementById('cmp-name')?.value || 'Untitled Group';
+    const type = document.getElementById('cmp-type')?.value || 'custom';
+    await Groups.add({ name, type, personIds: ids });
+    this.toast('Group saved!'); this.go('compare');
+  },
+  async loadGroup(id) {
+    const g = await Groups.getById(id);
+    if (!g) return;
+    document.getElementById('cmp-name').value = g.name;
+    document.getElementById('cmp-type').value = g.type;
+    document.querySelectorAll('.cmp-checkbox').forEach(cb => cb.checked = (g.personIds || []).includes(cb.value));
+    this.updateCmpSelection(); this.toast(`Loaded "${g.name}"`);
+  },
+  async deleteGroup(id) { if (!confirm('Delete this group?')) return; await Groups.delete(id); this.go('compare'); },
+  openGroup(id) { this.go('compare'); setTimeout(() => this.loadGroup(id), 50); },
+
+  // ── DATABASE FILTER ──────────────────────────────────────────────────────────────
+  async applyDbFilter() {
+    const name = document.getElementById('db-search')?.value || '';
+    const team = document.getElementById('db-f-team')?.value || '';
+    const party = document.getElementById('db-f-party')?.value || '';
+    const occupation = document.getElementById('db-f-occ')?.value || '';
+    const sortBy = document.getElementById('db-sort')?.value || 'name';
+    const verifiedF = document.getElementById('db-f-verified')?.value || '';
+    let verifiedFilter; if (verifiedF === 'verified') verifiedFilter = true; if (verifiedF === 'unverified') verifiedFilter = false;
+    const all = await DB.getAll();
+    const persons = DB.search(all, { name, team, party, occupation, verified: verifiedFilter });
+    const wrap = document.getElementById('db-table-wrap');
+    if (wrap) wrap.innerHTML = renderDbTable(persons, sortBy);
+    this.onRowCheck();
+  },
+
+  // ── MATCH / PREDICTIONS ──────────────────────────────────────────────────────────
+  async filterMatchPersons(q) {
+    const list = document.getElementById('mf-person-list');
+    if (!list) return;
+    const selected = [...document.querySelectorAll('.mf-checkbox:checked')].map(cb => cb.value);
+    const all = await DB.getAll();
+    const persons = DB.search(all, { name: q });
+    list.innerHTML = persons.map(p => `
+      <label class="cmp-person-item">
+        <input type="checkbox" value="${p.id}" class="mf-checkbox" ${selected.includes(p.id) ? 'checked' : ''} />
+        ${avatarHtml(p, 'xs')}<span class="cpi-name">${p.name}</span><span class="cpi-team">${getCurrentYearTeam(p)}</span>
+      </label>`).join('');
+  },
+  async saveMatch() {
+    const personIds = [...document.querySelectorAll('.mf-checkbox:checked')].map(cb => cb.value);
+    const match = {
+      title: document.getElementById('mf-title')?.value || 'Untitled Match',
+      venue: document.getElementById('mf-venue')?.value || '',
+      startDate: document.getElementById('mf-start-date')?.value,
+      startTime: document.getElementById('mf-start-time')?.value,
+      endDate: document.getElementById('mf-end-date')?.value,
+      endTime: document.getElementById('mf-end-time')?.value,
+      notes: document.getElementById('mf-notes')?.value || '',
+      personIds,
+    };
+    if (!match.startDate) { alert('Please set a start date.'); return; }
+    await Matches.add(match);
+    this.toast('Match saved!'); this.go('match');
+  },
+  async viewMatch(id) {
+    const m = await Matches.getById(id);
+    if (!m) return;
+    const result = document.getElementById('match-result');
+    if (result) { result.innerHTML = await renderMatchPrediction(m); result.scrollIntoView && result.scrollIntoView({ behavior: 'smooth' }); }
+  },
+  async deleteMatch(id) { if (!confirm('Delete this match?')) return; await Matches.delete(id); this.go('match'); },
+
+  // ── TOAST ────────────────────────────────────────────────────────────────────────
+  toast(msg) {
+    document.querySelectorAll('.toast').forEach(t => t.remove());
+    const t = document.createElement('div');
+    t.className = 'toast'; t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(() => t.classList.add('show'), 10);
+    setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 300); }, 2500);
+  }
+};
+
+document.addEventListener('DOMContentLoaded', () => App.init());

@@ -1,0 +1,88 @@
+// server/routes/public.js
+// ════════════════════════════════════════════════════════════════════════════
+// PUBLIC / VISITOR ROUTES — no login. Visitors never get local storage;
+// anything they do goes straight here (only with their consent for logging).
+// ════════════════════════════════════════════════════════════════════════════
+
+const express = require('express');
+const { db } = require('../db');
+
+const router = express.Router();
+
+// ── READ-ONLY VIEW OF OWNER'S DATA (for visitors to browse) ─────────────────────
+// Returns the (single) owner's persons in a trimmed, safe-to-share shape.
+router.get('/persons', async (req, res) => {
+  await db.read();
+  const owner = db.data.owners[0]; // single-owner site
+  if (!owner) return res.json({ persons: [] });
+  const persons = db.data.persons
+    .filter(p => p.ownerId === owner.id)
+    .map(p => ({
+      // Only expose what's reasonable for a public viewer; owner can adjust later
+      id: p.id, name: p.name, dob: p.dob, photo: p.photo || '',
+      occupation: p.occupation, party: p.party, jerseyNumber: p.jerseyNumber,
+      teamsByYear: p.teamsByYear, placeOfBirth: p.placeOfBirth,
+      verified: p.verified,
+    }));
+  res.json({ persons });
+});
+
+// ── VISITOR LOGGING (only if they consent) ──────────────────────────────────────
+router.post('/log-visit', async (req, res) => {
+  try {
+    const { consentGiven, location, device, page } = req.body;
+    if (!consentGiven) return res.json({ ok: true, logged: false }); // respect "no"
+
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+    await db.read();
+    db.data.visitors.push({
+      id: 'v_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+      ip,
+      location: location || null, // { lat, lng, city, country } if browser geolocation was allowed
+      device: device || null,     // { ua, platform, screen }
+      page: page || '/',
+      at: new Date().toISOString(),
+      consentGiven: true,
+    });
+    await db.write();
+    res.json({ ok: true, logged: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not log visit' });
+  }
+});
+
+// ── BOOKING / CALL REQUEST ──────────────────────────────────────────────────────
+router.post('/book-session', async (req, res) => {
+  try {
+    const { name, contact, preferredTime, message } = req.body;
+    if (!name || !contact) return res.status(400).json({ error: 'Name and contact info are required' });
+
+    await db.read();
+    const request = {
+      id: 'br_' + Date.now(),
+      name, contact, preferredTime: preferredTime || '', message: message || '',
+      at: new Date().toISOString(),
+      status: 'pending',
+    };
+    db.data.bookingRequests.push(request);
+    await db.write();
+    res.json({ ok: true, request });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not submit request' });
+  }
+});
+
+// ── OWNER CONTACT INFO (public-facing, shown to visitors) ───────────────────────
+router.get('/contact-info', async (req, res) => {
+  await db.read();
+  const owner = db.data.owners[0];
+  res.json({
+    name: owner?.name || '',
+    email: owner?.publicEmail || owner?.email || '',
+    phone: owner?.publicPhone || '',
+  });
+});
+
+module.exports = router;

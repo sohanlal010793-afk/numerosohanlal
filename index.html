@@ -1,0 +1,127 @@
+// ════════════════════════════════════════════════════════════════════════════
+// PREDICTION RULES ENGINE
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Evaluates whether a given dasha number is favorable/unfavorable for a person,
+// based on their kundali grid and destiny number, following these rules:
+//
+// 1. Dasha == Destiny number → BEST (strongest positive)
+// 2. Number 4 → always negative (kundali AND dasha), UNLESS multiple+destiny → mixed
+// 3. Number 8 → kundali even-count-8 is positive; dasha of 8 generally positive
+// 4. Number 1 →
+//      single 1, not destiny    → positive
+//      single 1, IS destiny     → positive (weaker)
+//      multiple 1, not destiny  → defame/negative
+//      multiple 1, IS destiny   → negative
+//      dasha == 1 → only general kundali-1 rules apply (no extra dasha bonus)
+// 5. Other numbers (2,3,5,6,7,9):
+//      0 occurrences in kundali → dasha brings it fresh → positive (conditional)
+//      1 occurrence             → dasha negative but conditional
+//      2+ occurrences           → negative in kundali AND as dasha
+
+function evaluateDashaNumber(kundali, dashaNumber) {
+  if (!kundali || dashaNumber == null) return null;
+  const counts = kundali.counts;
+  const destiny = kundali.destiny;
+  const c = counts[dashaNumber] || 0;
+
+  const result = { number: dashaNumber, verdict: 'NEUTRAL', strength: 0, reasons: [], badge: '' };
+
+  // Rule 1: destiny match overrides everything (shown first, but other rules still noted)
+  const isDestinyMatch = dashaNumber === destiny;
+
+  if (dashaNumber === 4) {
+    result.verdict = 'NEGATIVE'; result.strength = -2; result.badge = '⚠ Always Negative';
+    result.reasons.push('Number 4 is always negative — in kundali and as dasha, with no exceptions.');
+    if (c >= 2 && isDestinyMatch) {
+      result.verdict = 'MIXED'; result.strength = 0; result.badge = '⚡ Mixed (+ve & -ve)';
+      result.reasons.push('Multiple 4s AND destiny number 4 → mixed effect: strong positive and strong negative both apply.');
+    }
+    return result;
+  }
+
+  if (dashaNumber === 8) {
+    const c8 = counts[8] || 0;
+    if (c8 > 0 && c8 % 2 === 0) {
+      result.verdict = 'POSITIVE'; result.strength = 2; result.badge = '✓ Positive';
+      result.reasons.push(`Kundali has an even count of 8 (${c8}×) → positive.`);
+    } else {
+      result.verdict = 'POSITIVE'; result.strength = 1; result.badge = '✓ Generally Positive';
+      result.reasons.push('Dasha of 8 is generally positive.');
+      if (c8 % 2 !== 0 && c8 > 0) result.reasons.push(`Note: kundali has an odd count of 8 (${c8}×) — less ideal than even.`);
+    }
+    if (isDestinyMatch) result.reasons.push('Also matches destiny number — additional strength.');
+    return result;
+  }
+
+  if (dashaNumber === 1) {
+    const c1 = counts[1] || 0;
+    if (c1 === 1 && destiny !== 1) {
+      result.verdict = 'POSITIVE'; result.strength = 2; result.badge = '✓ Positive';
+      result.reasons.push('Single occurrence of 1, not the destiny number → positive.');
+    } else if (c1 === 1 && destiny === 1) {
+      result.verdict = 'POSITIVE'; result.strength = 1; result.badge = '✓ Positive (weaker)';
+      result.reasons.push('Single 1 AND destiny number is 1 → positive, but weaker than the non-destiny case.');
+    } else if (c1 >= 2 && destiny !== 1) {
+      result.verdict = 'NEGATIVE'; result.strength = -2; result.badge = '⚠ Defame Risk';
+      result.reasons.push('Multiple 1s, not the destiny number → risk of defame/scandal.');
+    } else if (c1 >= 2 && destiny === 1) {
+      result.verdict = 'NEGATIVE'; result.strength = -2; result.badge = '⚠ Negative';
+      result.reasons.push('Multiple 1s AND destiny number is 1 → negative.');
+    } else {
+      result.verdict = 'NEUTRAL'; result.strength = 0;
+      result.reasons.push('Number 1 absent from kundali — general rules for 1 inconclusive here.');
+    }
+    result.reasons.push('Dasha of 1 follows only the general kundali rules above (no separate dasha bonus).');
+    return result;
+  }
+
+  // General numbers: 2,3,5,6,7,9
+  if (c === 0) {
+    result.verdict = 'POSITIVE'; result.strength = 1; result.badge = '✓ Positive (conditional)';
+    result.reasons.push(`Number ${dashaNumber} is absent from the kundali — the dasha brings it fresh, generally positive but conditional on other factors.`);
+  } else if (c === 1) {
+    result.verdict = 'NEGATIVE'; result.strength = -1; result.badge = '⚠ Negative (conditional)';
+    result.reasons.push(`Single occurrence of ${dashaNumber} in kundali — dasha is negative but conditional, may be mild.`);
+  } else {
+    result.verdict = 'NEGATIVE'; result.strength = -2; result.badge = '⚠ Negative';
+    result.reasons.push(`Multiple occurrences of ${dashaNumber} (${c}×) in kundali → negative both in kundali and as dasha.`);
+  }
+
+  if (isDestinyMatch) {
+    result.reasons.push('This number also matches the destiny number — the best possible dasha for this person.');
+    result.verdict = 'BEST'; result.strength = 3; result.badge = '★ BEST — Destiny Match';
+  }
+
+  return result;
+}
+
+// Evaluate a full dasha snapshot (maha/antar/praty/daily/hourly/minute) against kundali
+function evaluateFullSnapshot(kundali, snapshot) {
+  if (!kundali || !snapshot) return null;
+  const levels = ['maha', 'antar', 'praty', 'daily', 'hourly', 'minute'];
+  const out = {};
+  levels.forEach(lvl => {
+    const data = snapshot[lvl];
+    if (!data) return;
+    out[lvl] = evaluateDashaNumber(kundali, data.num);
+  });
+  return out;
+}
+
+// Overall combined score across all active levels (simple sum, for quick comparison ranking)
+function overallScore(evalResult) {
+  if (!evalResult) return 0;
+  return Object.values(evalResult).reduce((sum, r) => sum + (r ? r.strength : 0), 0);
+}
+
+function verdictColor(verdict) {
+  return { BEST: 'var(--v-best)', POSITIVE: 'var(--v-pos)', NEUTRAL: 'var(--v-neu)',
+    MIXED: 'var(--v-mixed)', NEGATIVE: 'var(--v-neg)' }[verdict] || 'var(--v-neu)';
+}
+
+function renderVerdictBadge(evalItem) {
+  if (!evalItem) return '';
+  const cls = { BEST:'v-best', POSITIVE:'v-pos', NEUTRAL:'v-neu', MIXED:'v-mixed', NEGATIVE:'v-neg' }[evalItem.verdict] || 'v-neu';
+  return `<span class="verdict-badge ${cls}" title="${evalItem.reasons.join(' ')}">${evalItem.badge || evalItem.verdict}</span>`;
+}

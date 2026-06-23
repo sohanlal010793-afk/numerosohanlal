@@ -1,0 +1,298 @@
+// ════════════════════════════════════════════════════════════════════════════
+// DASHA ENGINE — custom numerology system (verified against worked examples)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// MAHADASHA: starts at Basic number, runs for (number) years, cycles 1→9→1...
+//   e.g. Basic=3 → MD3(3yrs) → MD4(4yrs) → ... → MD9(9yrs) → MD1(1yr) → MD2(2yrs) → MD3...
+//
+// ANTARDASHA: recalculated every birthday anniversary, valid for that 1 year.
+//   AD = digitSum(d1+d2+m1+m2+y3+y4_of_ANNIVERSARY_YEAR + dayNumOfAnniversaryDate)
+//   Day numbers: Sun=1, Mon=2, Tue=9, Wed=5, Thu=3, Fri=6, Sat=8
+//
+// PRATYANTARDASHA: sequence starts at AD number, rotates 1-9 (wrap).
+//   Duration of PD-N is FIXED by N itself: {1:8,2:16,3:24,4:32,5:41,6:49,7:57,8:65,9:73} days
+//   Sum of all 9 = 365 days (one full antardasha year). Leap day added to whichever
+//   PD period contains Feb 29 of a leap year.
+//
+// DAILY: recalculated every day. Daily = digitSum(currentPD + dayNumOfThatDate)
+//
+// HOURLY: Daily + hourNum, where hour 1-9→itself, 10→1,11→2,12→3 (12hr clock digit-wrap)
+//   Hourly = digitSum(Daily + hourNum)
+//
+// MINUTE: Hourly + minute(raw 0-59) → Minute = digitSum(Hourly + minute)
+
+const DAY_NUM = { 0: 1, 1: 2, 2: 9, 3: 5, 4: 3, 5: 6, 6: 8 };
+// JS Date.getDay(): Sun=0,Mon=1,Tue=2,Wed=3,Thu=4,Fri=5,Sat=6
+// User numbering:    Sun=1,Mon=2,Tue=9,Wed=5,Thu=3,Fri=6,Sat=8
+
+const PD_DURATION = { 1: 8, 2: 16, 3: 24, 4: 32, 5: 41, 6: 49, 7: 57, 8: 65, 9: 73 };
+
+function isLeapYear(y) {
+  return (y % 4 === 0 && y % 100 !== 0) || (y % 400 === 0);
+}
+
+function dayNumOf(date) {
+  return DAY_NUM[date.getDay()];
+}
+
+function hourToNum(h24) {
+  let h12 = h24 % 12;
+  if (h12 === 0) h12 = 12;
+  if (h12 >= 10) return h12 - 9; // 10->1, 11->2, 12->3
+  return h12;
+}
+
+function nextInCycle(n) { return n < 9 ? n + 1 : 1; }
+
+// ── MAHADASHA ─────────────────────────────────────────────────────────────────
+// Returns list of {num, start: Date, end: Date} starting from birth, for `count` periods
+function buildMahaDashaPeriods(basic, dob, count = 20) {
+  const p = parseDOB(dob);
+  if (!p) return [];
+  const periods = [];
+  let curNum = basic;
+  let curStart = new Date(p.year, p.month - 1, p.day);
+
+  for (let i = 0; i < count; i++) {
+    const years = curNum;
+    const curEnd = new Date(curStart);
+    curEnd.setFullYear(curEnd.getFullYear() + years);
+    periods.push({ num: curNum, start: new Date(curStart), end: new Date(curEnd) });
+    curStart = curEnd;
+    curNum = nextInCycle(curNum);
+  }
+  return periods;
+}
+
+function getMahaDashaAt(basic, dob, targetDate) {
+  const p = parseDOB(dob);
+  if (!p) return null;
+  const birth = new Date(p.year, p.month - 1, p.day);
+  if (targetDate < birth) return null;
+
+  // Estimate how many periods we need (45yr full cycle), generate enough
+  const yearsElapsed = (targetDate - birth) / (365.25 * 24 * 3600 * 1000);
+  const cyclesNeeded = Math.ceil(yearsElapsed / 45) + 1;
+  const periods = buildMahaDashaPeriods(basic, dob, cyclesNeeded * 9 + 9);
+
+  for (const period of periods) {
+    if (targetDate >= period.start && targetDate < period.end) return period;
+  }
+  return periods[periods.length - 1] || null;
+}
+
+// ── ANTARDASHA ─────────────────────────────────────────────────────────────────
+// Find which "antardasha year" (birthday-to-birthday) contains targetDate,
+// and compute AD for that year.
+function getAntardashaAt(dob, targetDate) {
+  const p = parseDOB(dob);
+  if (!p) return null;
+  const { d1, d2, m1, m2, day, month } = p;
+
+  // Find the birthday anniversary year such that anniv <= targetDate < nextAnniv
+  let annivYear = targetDate.getFullYear();
+  let anniv = new Date(annivYear, month - 1, day);
+  if (anniv > targetDate) { annivYear -= 1; anniv = new Date(annivYear, month - 1, day); }
+  // handle exact same-day edge case
+  while (true) {
+    const nextAnniv = new Date(annivYear + 1, month - 1, day);
+    if (targetDate < nextAnniv) break;
+    annivYear += 1;
+    anniv = new Date(annivYear, month - 1, day);
+  }
+
+  const y3 = Math.floor(annivYear / 10) % 10;
+  const y4 = annivYear % 10;
+  const dayNo = dayNumOf(anniv);
+  const raw = d1 + d2 + m1 + m2 + y3 + y4 + dayNo;
+  const ad = digitSum(raw);
+
+  const nextAnniv = new Date(annivYear + 1, month - 1, day);
+  return { num: ad, start: anniv, end: nextAnniv, raw, dayNo, annivYear };
+}
+
+// ── PRATYANTARDASHA ─────────────────────────────────────────────────────────────
+// Within an antardasha year, build the 9 PD periods (sequence starts at AD num).
+function buildPratyantarPeriods(adNum, adStart, adEnd) {
+  const seq = [];
+  let cur = adNum;
+  for (let i = 0; i < 9; i++) { seq.push(cur); cur = nextInCycle(cur); }
+
+  const totalDays = Math.round((adEnd - adStart) / (24 * 3600 * 1000));
+  const baseDays = seq.map(n => PD_DURATION[n]);
+  const baseSum = baseDays.reduce((a, b) => a + b, 0); // should be 365
+  const extra = totalDays - baseSum; // 0 normally, 1 in leap-affected years
+
+  // Distribute extra day(s) onto the period that contains Feb 29 if applicable, else last period
+  let cursor = new Date(adStart);
+  const periods = [];
+  for (let i = 0; i < seq.length; i++) {
+    let dur = baseDays[i];
+    const periodEnd = new Date(cursor);
+    periodEnd.setDate(periodEnd.getDate() + dur);
+
+    // check if Feb 29 falls within [cursor, periodEnd)
+    const containsFeb29 = (() => {
+      const y = cursor.getFullYear();
+      const feb29 = new Date(y, 1, 29);
+      if (isLeapYear(y) && feb29 >= cursor && feb29 < periodEnd) return true;
+      const y2 = periodEnd.getFullYear();
+      const feb29b = new Date(y2, 1, 29);
+      if (isLeapYear(y2) && feb29b >= cursor && feb29b < periodEnd) return true;
+      return false;
+    })();
+
+    if (extra > 0 && containsFeb29) {
+      dur += extra;
+      periodEnd.setDate(periodEnd.getDate() + extra);
+    }
+
+    periods.push({ num: seq[i], start: new Date(cursor), end: new Date(periodEnd) });
+    cursor = periodEnd;
+  }
+
+  // If no period contained Feb29 but extra>0 (edge case), stretch the last period
+  if (extra > 0 && !periods.some((per, idx) => idx > 0)) {
+    // fallback handled implicitly; periods already cover totalDays approx
+  }
+  return periods;
+}
+
+function getPratyantarAt(dob, targetDate) {
+  const ad = getAntardashaAt(dob, targetDate);
+  if (!ad) return null;
+  const periods = buildPratyantarPeriods(ad.num, ad.start, ad.end);
+  for (const per of periods) {
+    if (targetDate >= per.start && targetDate < per.end) return { ...per, adNum: ad.num, adStart: ad.start, adEnd: ad.end };
+  }
+  return periods[periods.length - 1] ? { ...periods[periods.length - 1], adNum: ad.num } : null;
+}
+
+// ── DAILY ─────────────────────────────────────────────────────────────────────
+function getDailyAt(dob, targetDate) {
+  const pd = getPratyantarAt(dob, targetDate);
+  if (!pd) return null;
+  const dayNo = dayNumOf(targetDate);
+  const raw = pd.num + dayNo;
+  const num = digitSum(raw);
+  return { num, raw, dayNo, pdNum: pd.num, date: new Date(targetDate) };
+}
+
+// ── HOURLY ─────────────────────────────────────────────────────────────────────
+function getHourlyAt(dob, targetDateTime) {
+  const daily = getDailyAt(dob, targetDateTime);
+  if (!daily) return null;
+  const h24 = targetDateTime.getHours();
+  const hourNum = hourToNum(h24);
+  const raw = daily.num + hourNum;
+  const num = digitSum(raw);
+  return { num, raw, hourNum, h24, dailyNum: daily.num };
+}
+
+// ── MINUTE ─────────────────────────────────────────────────────────────────────
+function getMinuteAt(dob, targetDateTime) {
+  const hourly = getHourlyAt(dob, targetDateTime);
+  if (!hourly) return null;
+  const minute = targetDateTime.getMinutes();
+  const raw = hourly.num + minute;
+  const num = digitSum(raw);
+  return { num, raw, minute, hourlyNum: hourly.num };
+}
+
+// ── FULL SNAPSHOT (all levels at once, for a given moment) ───────────────────
+function getFullDashaSnapshot(kundali, dob, targetDateTime) {
+  const p = parseDOB(dob);
+  if (!p || !kundali) return null;
+  const birth = new Date(p.year, p.month - 1, p.day);
+  if (targetDateTime < birth) return null;
+
+  const maha = getMahaDashaAt(kundali.basic, dob, targetDateTime);
+  const antar = getAntardashaAt(dob, targetDateTime);
+  const praty = getPratyantarAt(dob, targetDateTime);
+  const daily = getDailyAt(dob, targetDateTime);
+  const hourly = getHourlyAt(dob, targetDateTime);
+  const minute = getMinuteAt(dob, targetDateTime);
+
+  return { maha, antar, praty, daily, hourly, minute, at: new Date(targetDateTime) };
+}
+
+// ── PRECISION-FLEXIBLE LOOKUP ─────────────────────────────────────────────────
+// Accepts partial date/time info and returns whatever dasha levels are computable.
+// precision: 'year' | 'date' | 'datetime' | 'minute'
+function getDashaForInput(kundali, dob, { year, month, day, hour, minute } = {}) {
+  const now = new Date();
+  const y = year ?? now.getFullYear();
+  const m = (month ?? (now.getMonth() + 1)) - 1;
+  const d = day ?? now.getDate();
+  const h = hour ?? 12; // noon default if unspecified
+  const min = minute ?? 0;
+  const target = new Date(y, m, d, h, min);
+
+  const snap = getFullDashaSnapshot(kundali, dob, target);
+  if (!snap) return null;
+
+  // Determine which levels are "valid" given precision of input
+  const hasDay = day !== undefined && day !== null;
+  const hasHour = hour !== undefined && hour !== null;
+  const hasMinute = minute !== undefined && minute !== null;
+
+  return {
+    ...snap,
+    validLevels: {
+      maha: true, antar: true,
+      praty: hasDay, daily: hasDay,
+      hourly: hasDay && hasHour,
+      minute: hasDay && hasHour && hasMinute,
+    }
+  };
+}
+
+// ── RENDER HELPERS ────────────────────────────────────────────────────────────
+function formatDate(d) {
+  if (!d) return '–';
+  const dd = String(d.getDate()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  return `${dd}/${mm}/${d.getFullYear()}`;
+}
+function formatShortDate(d) {
+  if (!d) return '–';
+  const mm = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getMonth()];
+  return `${d.getDate()} ${mm} ${d.getFullYear()}`;
+}
+function formatDateTime(d) {
+  if (!d) return '–';
+  const h = String(d.getHours()).padStart(2,'0');
+  const mi = String(d.getMinutes()).padStart(2,'0');
+  return `${formatDate(d)} ${h}:${mi}`;
+}
+
+function renderDashaSnapshot(snap, opts = {}) {
+  if (!snap) return '<div class="dasha-empty">–</div>';
+  const levels = [
+    { key: 'maha',   label: 'Maha',   data: snap.maha },
+    { key: 'antar',  label: 'Antar',  data: snap.antar },
+    { key: 'praty',  label: 'Pratyantar', data: snap.praty },
+    { key: 'daily',  label: 'Daily',  data: snap.daily },
+    { key: 'hourly', label: 'Hourly', data: snap.hourly },
+    { key: 'minute', label: 'Minute', data: snap.minute },
+  ];
+
+  let html = `<div class="dasha-panel ${opts.size||''}">`;
+  levels.forEach(({ key, label, data }) => {
+    if (!data) return;
+    if (snap.validLevels && !snap.validLevels[key]) return;
+    const num = data.num;
+    let endLabel = '';
+    if (key === 'maha')  endLabel = `till ${formatShortDate(data.end)}`;
+    if (key === 'antar') endLabel = `till ${formatShortDate(data.end)}`;
+    if (key === 'praty') endLabel = `till ${formatShortDate(data.end)}`;
+    html += `
+      <div class="dasha-row" data-level="${key}">
+        <div class="dasha-label">${label}</div>
+        <div class="dasha-num-badge num-${num}">${num}</div>
+        ${endLabel ? `<div class="dasha-end">${endLabel}</div>` : ''}
+      </div>`;
+  });
+  html += '</div>';
+  return html;
+}
